@@ -86,7 +86,7 @@ if [ -d "$TARGET_DIR/.git" ]; then
     # 如果存在 Git 仓库，进入目录并更新代码
     echo "更新现有仓库在 $TARGET_DIR..."
     git -C "$TARGET_DIR" fetch origin "$BRANCH"
-    git -C "$TARGET_DIR" reset --hard "origin/$BRANCH"
+    git -C "$TARGET_DIR" reset --hard FETCH_HEAD
     ACTION="pull"
 elif is_empty_dir "$TARGET_DIR"; then
     # 如果目录为空，克隆新的仓库
