@@ -52,15 +52,23 @@ else
 fi
 
 # 配置 Git 认证
-echo "从储存库克隆..."
+echo "配置 Git 认证..."
+# 禁用交互式密码提示
+git config --global core.askPass ""
 git config --global credential.helper store
 
 # 根据平台配置认证信息
 if [ -n "${GITEE_TOKEN:-}" ]; then
     echo "https://${GITEE_USERNAME}:${GITEE_TOKEN}@gitee.com" > ~/.git-credentials
+    echo "使用 Gitee 认证"
 else
-    echo "https://${GITHUB_PAT}:x-oauth-basic@github.com" > ~/.git-credentials
+    echo "https://${GITHUB_PAT}@github.com" > ~/.git-credentials
+    echo "使用 GitHub 认证"
 fi
+
+# 设置 Git 环境变量，避免密码提示
+export GIT_TERMINAL_PROMPT=0
+export GIT_ASKPASS=/bin/echo
 
 
 # 如果是 Debian/Ubuntu 基础镜像
