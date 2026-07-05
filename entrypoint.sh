@@ -88,30 +88,58 @@ fi
 
 
 ACTION="none"
+DATA_DIR="/data"
 
-# 检查 /app 目录是否已存在 Git 仓库或为空
-if [ -d "$TARGET_DIR/.git" ]; then
-    # 如果存在 Git 仓库，进入目录并更新代码
-    echo "更新现有仓库在 $TARGET_DIR..."
-    git -C "$TARGET_DIR" fetch origin "$BRANCH"
-    git -C "$TARGET_DIR" reset --hard FETCH_HEAD
-    ACTION="pull"
-elif is_empty_dir "$TARGET_DIR"; then
-    # 如果目录为空，克隆新的仓库
-    echo "从储存库克隆到 $TARGET_DIR..."
-    git clone -b "$BRANCH" "$GIT_REPO" "$TARGET_DIR"
-    ACTION="clone"
-else
-    # 目录非空且不是 Git 仓库（多见于挂载了宿主机目录）
-    echo "[warn] $TARGET_DIR 非空且不是 Git 仓库，跳过 clone，使用现有文件。"
-    ACTION="skip"
+# 检查是否挂载了 data 目录
+if [ -d "$DATA_DIR" ] && ! is_empty_dir "$DATA_DIR"; then
+    echo "检测到 data 目录挂载，准备同步..."
+    
+    # 清空 /app 目录（保留 .git 如果存在）
+    if [ -d "$TARGET_DIR/.git" ]; then
+        # 保留 .git 目录，清空其他内容
+        find "$TARGET_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+    else
+        # 清空整个目录
+        rm -rf "${TARGET_DIR:?}"/*
+    fi
+    
+    # 硬链接 data 目录中的文件（排除 .git）
+    echo "从 $DATA_DIR 硬链接文件到 $TARGET_DIR..."
+    find "$DATA_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' | while read -r item; do
+        ln -f "$item" "$TARGET_DIR/" 2>/dev/null || cp -a "$item" "$TARGET_DIR/"
+    done
+    
+    ACTION="link"
+fi
+
+# 如果没有 data 目录或 data 目录为空，执行原有的克隆/更新逻辑
+if [ "$ACTION" = "none" ]; then
+    # 检查 /app 目录是否已存在 Git 仓库或为空
+    if [ -d "$TARGET_DIR/.git" ]; then
+        # 如果存在 Git 仓库，进入目录并更新代码
+        echo "更新现有仓库在 $TARGET_DIR..."
+        git -C "$TARGET_DIR" fetch origin "$BRANCH"
+        git -C "$TARGET_DIR" reset --hard FETCH_HEAD
+        ACTION="pull"
+    elif is_empty_dir "$TARGET_DIR"; then
+        # 如果目录为空，克隆新的仓库
+        echo "从储存库克隆到 $TARGET_DIR..."
+        git clone -b "$BRANCH" "$GIT_REPO" "$TARGET_DIR"
+        ACTION="clone"
+    else
+        # 目录非空且不是 Git 仓库（多见于挂载了宿主机目录）
+        echo "[warn] $TARGET_DIR 非空且不是 Git 仓库，跳过 clone，使用现有文件。"
+        ACTION="skip"
+    fi
 fi
 
 # 根据执行结果给出提示
 if [ "$ACTION" = "clone" ] || [ "$ACTION" = "pull" ]; then
     echo "从储存库$([ "$ACTION" = "clone" ] && echo 克隆 || echo 更新)成功."
+elif [ "$ACTION" = "link" ]; then
+    echo "从 data 目录同步文件完成."
 else
-    # 跳过 clone 的场景：不视为失败，但提示如何切换到‘仓库模式’
+    # 跳过 clone 的场景：不视为失败，但提示如何切换到'仓库模式'
     echo "已跳过从储存库克隆/更新（目录非空且非 Git 仓库）。若需使用 Git，请清空 $TARGET_DIR 或更改 TARGET_DIR 至空目录（例如 /src）。"
 fi
 
