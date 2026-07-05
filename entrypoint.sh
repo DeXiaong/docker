@@ -115,12 +115,15 @@ fi
 # 如果没有 data 目录或 data 目录为空，执行原有的克隆/更新逻辑
 if [ "$ACTION" = "none" ]; then
     # 检查 /app 目录是否已存在 Git 仓库或为空
-    if [ -d "$TARGET_DIR/.git" ]; then
-        # 如果存在 Git 仓库，进入目录并更新代码
+    if [ -d "$TARGET_DIR/.git" ] && git -C "$TARGET_DIR" rev-parse --git-dir > /dev/null 2>&1; then
+        # 如果存在有效的 Git 仓库，进入目录并更新代码
         echo "更新现有仓库在 $TARGET_DIR..."
-        git -C "$TARGET_DIR" fetch origin "$BRANCH"
-        git -C "$TARGET_DIR" reset --hard FETCH_HEAD
-        ACTION="pull"
+        if git -C "$TARGET_DIR" fetch origin "$BRANCH" && git -C "$TARGET_DIR" reset --hard FETCH_HEAD; then
+            ACTION="pull"
+        else
+            echo "[warn] Git 更新失败，使用现有文件"
+            ACTION="skip"
+        fi
     elif is_empty_dir "$TARGET_DIR"; then
         # 如果目录为空，克隆新的仓库
         echo "从储存库克隆到 $TARGET_DIR..."
