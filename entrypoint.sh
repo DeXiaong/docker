@@ -2,6 +2,313 @@
 
 set -euo pipefail
 
+# 自动更新管理器：仅使用 Bash 和镜像内的常规 Linux 工具。
+au_log() { printf '[auto-update] %s\n' "$*"; }
+
+au_validate_number() {
+    local name="$1" value="$2" minimum="$3"
+    if ! [[ "$value" =~ ^(0|[1-9][0-9]{0,5})$ ]] || (( value < minimum )); then
+        au_log "[error] $name 必须为 $minimum 到 999999 之间的整数"
+        return 1
+    fi
+}
+
+au_stop_group() {
+    local pid="${1:-}" i
+    [ -n "$pid" ] || return 0
+    # 信号可能早于 setsid 完成，此时直接终止尚未建立进程组的子进程。
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for ((i=0; i<AU_STOP_TIMEOUT*10; i++)); do
+        kill -0 -- "-$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+au_signal() {
+    AU_STOPPING=1
+    if [ -n "${AU_TASK_PID:-}" ]; then
+        kill -TERM -- "-$AU_TASK_PID" 2>/dev/null || kill -TERM "$AU_TASK_PID" 2>/dev/null || true
+    fi
+    if [ -n "${AU_APP_PID:-}" ]; then
+        kill -TERM -- "-$AU_APP_PID" 2>/dev/null || kill -TERM "$AU_APP_PID" 2>/dev/null || true
+    fi
+}
+
+au_stop_app() {
+    au_stop_group "${AU_APP_PID:-}"
+    AU_APP_PID=""
+}
+
+au_discard_candidate() {
+    if [ -n "${AU_CANDIDATE:-}" ] && [ "$AU_CANDIDATE" != "${AU_CURRENT:-}" ]; then
+        rm -rf -- "$AU_CANDIDATE"
+    fi
+    AU_CANDIDATE=""
+}
+
+au_exit() {
+    local status=$?
+    trap - EXIT
+    au_stop_group "${AU_TASK_PID:-}"
+    au_stop_app
+    au_discard_candidate
+    [ "$AU_STOPPING" = 0 ] || status=0
+    exit "$status"
+}
+
+# 不使用命令替换运行耗时任务，确保主 shell 始终持有 PID 并能传递停止信号。
+au_run() {
+    local directory="$1" limit="$2" status=0
+    shift 2
+    [ "$AU_STOPPING" = 0 ] || return 130
+    (
+        cd -- "$directory" || exit 1
+        exec setsid timeout --signal=TERM --kill-after="${AU_STOP_TIMEOUT}s" "${limit}s" "$@"
+    ) &
+    AU_TASK_PID=$!
+    wait "$AU_TASK_PID" || status=$?
+    if [ "$AU_STOPPING" != 0 ]; then
+        au_stop_group "$AU_TASK_PID"
+        status=130
+    fi
+    AU_TASK_PID=""
+    return "$status"
+}
+
+au_fetch() {
+    # Git 的诊断可能包含认证 URL，不把它输出到容器日志。
+    if ! au_run "$AU_ROOT" "$AU_GIT_TIMEOUT" git --git-dir "$AU_REPO" \
+        fetch --no-tags --force "$GIT_REPO" "$BRANCH" >"$AU_ROOT/git.log" 2>&1; then
+        return 1
+    fi
+    AU_FETCHED=$(git --git-dir "$AU_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || return 1
+    [[ "$AU_FETCHED" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]
+}
+
+au_prepare() {
+    local commit="$1" requirement
+    AU_CANDIDATE=$(mktemp -d "$AU_RELEASES/$commit.XXXXXX") || return 1
+    au_log "准备版本 ${commit:0:12}，旧服务继续运行"
+    au_run "$AU_ROOT" "$AU_BUILD_TIMEOUT" git clone --quiet --no-hardlinks --no-checkout \
+        "$AU_REPO" "$AU_CANDIDATE/code" >"$AU_ROOT/build-git.log" 2>&1 || return 1
+    au_run "$AU_ROOT" "$AU_BUILD_TIMEOUT" git -C "$AU_CANDIDATE/code" \
+        checkout --quiet --detach "$commit" >>"$AU_ROOT/build-git.log" 2>&1 || return 1
+    au_run "$AU_ROOT" "$AU_BUILD_TIMEOUT" python3 -m venv "$AU_CANDIDATE/venv" || return 1
+    find "$AU_CANDIDATE/code" -name .git -prune -o -type f -name requirements.txt -print0 \
+        >"$AU_CANDIDATE/requirements.list" || return 1
+    while IFS= read -r -d '' requirement; do
+        au_log "安装依赖：${requirement#"$AU_CANDIDATE/code/"}"
+        VIRTUAL_ENV="$AU_CANDIDATE/venv" PATH="$AU_CANDIDATE/venv/bin:$PATH" \
+            au_run "$(dirname "$requirement")" "$AU_BUILD_TIMEOUT" \
+            "$AU_CANDIDATE/venv/bin/python" -m pip install --disable-pip-version-check \
+            -r "$requirement" || return 1
+    done <"$AU_CANDIDATE/requirements.list"
+    printf '%s\n' "$commit" >"$AU_CANDIDATE/commit" || return 1
+    touch "$AU_CANDIDATE/.ready" || return 1
+}
+
+au_app_alive() {
+    [ -n "${AU_APP_PID:-}" ] && kill -0 "$AU_APP_PID" 2>/dev/null
+}
+
+au_start() {
+    local release="$1" started=$SECONDS commit remaining
+    commit=$(cat "$release/commit") || return 1
+    au_log "启动版本 ${commit:0:12}"
+    (
+        cd -- "$release/code" || exit 1
+        export VIRTUAL_ENV="$release/venv" PATH="$release/venv/bin:$PATH"
+        export PYTHONUNBUFFERED=1 APP_COMMIT="$commit"
+        unset PYTHONHOME
+        exec setsid bash -c "${RUN_COMMAND:-python3 main.py}"
+    ) &
+    AU_APP_PID=$!
+    while [ "$AU_STOPPING" = 0 ]; do
+        if ! au_app_alive; then
+            au_log "[warn] 后端在启动观察期内退出"
+            return 1
+        fi
+        if (( SECONDS - started >= AU_GRACE )); then
+            if [ -z "$AU_HEALTH_URL" ]; then
+                return 0
+            fi
+            remaining=$((AU_HEALTH_TIMEOUT - (SECONDS - started)))
+            if (( remaining <= 0 )); then
+                au_log "[warn] 健康检查超时"
+                return 1
+            fi
+            (( remaining <= 2 )) || remaining=2
+            if au_run "$AU_ROOT" 3 curl --noproxy '*' --fail --silent --output /dev/null \
+                --max-time "$remaining" "$AU_HEALTH_URL" && au_app_alive; then
+                return 0
+            fi
+        fi
+        if (( SECONDS - started >= AU_HEALTH_TIMEOUT )); then
+            au_log "[warn] 健康检查超时"
+            return 1
+        fi
+        au_run "$AU_ROOT" 2 sleep 1 || return 1
+    done
+    return 1
+}
+
+au_load_current() {
+    local name
+    AU_CURRENT="" AU_CURRENT_COMMIT=""
+    [ -f "$AU_ROOT/current" ] || return 0
+    IFS= read -r name <"$AU_ROOT/current" || return 1
+    [[ "$name" =~ ^[0-9a-f]{40}([0-9a-f]{24})?\.[a-zA-Z0-9]+$ ]] || return 1
+    AU_CURRENT="$AU_RELEASES/$name"
+    [ -f "$AU_CURRENT/.ready" ] && [ -d "$AU_CURRENT/code" ] && \
+        [ -x "$AU_CURRENT/venv/bin/python" ] || return 1
+    AU_CURRENT_COMMIT=$(cat "$AU_CURRENT/commit") || return 1
+    [ "${name%%.*}" = "$AU_CURRENT_COMMIT" ]
+}
+
+au_save_current() {
+    printf '%s\n' "${AU_CANDIDATE##*/}" >"$AU_ROOT/current.tmp" && \
+        mv -f -- "$AU_ROOT/current.tmp" "$AU_ROOT/current"
+}
+
+au_cleanup() {
+    local previous="$1" entry directory count=0
+    while IFS= read -r -d '' entry; do
+        directory="${entry#* }"
+        [ -f "$directory/.ready" ] || continue
+        count=$((count + 1))
+        if (( count > AU_KEEP )) && [ "$directory" != "$AU_CURRENT" ] && [ "$directory" != "$previous" ]; then
+            rm -rf -- "$directory" || return 1
+        fi
+    done < <(find "$AU_RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\0' | sort -z -nr)
+}
+
+# 返回 1：候选版本失败、旧版仍可用；返回 2：无法恢复服务。
+au_deploy() {
+    local commit="$1" previous="$AU_CURRENT" failed=0
+    if ! au_prepare "$commit"; then
+        au_log "[warn] 新版本准备失败，不切换旧服务"
+        au_discard_candidate
+        return 1
+    fi
+    if [ "$AU_STOPPING" != 0 ]; then
+        au_discard_candidate
+        return 1
+    fi
+    au_stop_app
+    au_start "$AU_CANDIDATE" || failed=1
+    if [ "$failed" = 0 ]; then
+        au_save_current || failed=1
+    fi
+    if [ "$failed" != 0 ]; then
+        au_stop_app
+        au_discard_candidate
+        if [ -n "$previous" ] && [ "$AU_STOPPING" = 0 ]; then
+            au_log "新版本不可用，恢复旧版本"
+            au_start "$previous" || return 2
+        fi
+        return 1
+    fi
+    AU_CURRENT="$AU_CANDIDATE" AU_CURRENT_COMMIT="$commit" AU_CANDIDATE=""
+    au_log "版本 ${commit:0:12} 已通过检查并启用"
+    au_cleanup "$previous" || au_log "[warn] 清理旧版本失败，不影响当前服务"
+}
+
+au_check_update() {
+    local status
+    if ! au_fetch; then
+        [ "$AU_STOPPING" != 0 ] || au_log "[warn] Git 检查失败，保持当前服务，下次重试"
+        return 0
+    fi
+    if [ "$AU_FETCHED" = "$AU_CURRENT_COMMIT" ]; then
+        AU_FAILED_COMMIT=""
+        return 0
+    fi
+    [ "$AU_FETCHED" != "$AU_FAILED_COMMIT" ] || return 0
+    if au_deploy "$AU_FETCHED"; then
+        AU_FAILED_COMMIT=""
+    else
+        status=$?
+        AU_FAILED_COMMIT="$AU_FETCHED"
+        au_log "[warn] 更新失败，同一提交本次运行不再重试"
+        [ "$status" != 2 ] || return 1
+        [ "$AU_STOPPING" != 0 ] || au_app_alive || return 1
+    fi
+}
+
+au_main() {
+    local key tool name value minimum next_check
+    umask 077
+    set +m
+    AU_STOPPING=0 AU_TASK_PID="" AU_APP_PID="" AU_CANDIDATE=""
+    AU_CURRENT="" AU_CURRENT_COMMIT="" AU_FAILED_COMMIT=""
+    AU_INTERVAL="${UPDATE_INTERVAL:-60}" AU_GIT_TIMEOUT="${GIT_TIMEOUT:-60}"
+    AU_BUILD_TIMEOUT="${BUILD_TIMEOUT:-900}" AU_STOP_TIMEOUT="${STOP_TIMEOUT:-20}"
+    AU_GRACE="${STARTUP_GRACE_SECONDS:-10}" AU_HEALTH_TIMEOUT="${HEALTHCHECK_TIMEOUT:-60}"
+    AU_KEEP="${UPDATE_KEEP_RELEASES:-3}" AU_HEALTH_URL="${HEALTHCHECK_URL:-}"
+    for name in INTERVAL GIT_TIMEOUT BUILD_TIMEOUT STOP_TIMEOUT GRACE HEALTH_TIMEOUT KEEP; do
+        value="AU_$name" minimum=1
+        [ "$name" != GRACE ] || minimum=0
+        [ "$name" != KEEP ] || minimum=2
+        au_validate_number "$value" "${!value}" "$minimum" || return 1
+    done
+    if (( AU_HEALTH_TIMEOUT < AU_GRACE )); then
+        au_log "[error] HEALTHCHECK_TIMEOUT 不能小于 STARTUP_GRACE_SECONDS"
+        return 1
+    fi
+    case "$AU_HEALTH_URL" in
+        ''|http://*|https://*) ;;
+        *) au_log "[error] HEALTHCHECK_URL 必须使用 http:// 或 https://"; return 1 ;;
+    esac
+    [ -n "${BRANCH:-}" ] && [[ "$BRANCH" != -* ]] || return 1
+    for tool in git python3 curl setsid flock timeout sha256sum find sort; do
+        command -v "$tool" >/dev/null || { au_log "[error] 缺少命令 $tool，请重建镜像"; return 1; }
+    done
+    # 排除凭据，使 Token 轮换不影响已验证版本的缓存。
+    key=$(printf '%s' "${GIT_REPO##*@}#$BRANCH" | sha256sum) || return 1
+    mkdir -p -- "${UPDATE_STATE_DIR:-/config/auto-update}" || return 1
+    AU_ROOT=$(cd -- "${UPDATE_STATE_DIR:-/config/auto-update}" && pwd) || return 1
+    AU_ROOT="$AU_ROOT/${key:0:16}"
+    AU_REPO="$AU_ROOT/repository.git"
+    AU_RELEASES="$AU_ROOT/releases"
+    mkdir -p -- "$AU_RELEASES" || return 1
+    exec {AU_LOCK_FD}>"$AU_ROOT/update.lock"
+    flock -n "$AU_LOCK_FD" || { au_log "[error] 同一仓库已有更新管理器运行"; return 1; }
+    trap au_signal TERM INT
+    trap au_exit EXIT
+    if [ ! -d "$AU_REPO" ]; then
+        au_run "$AU_ROOT" "$AU_GIT_TIMEOUT" git init --bare "$AU_REPO" \
+            >"$AU_ROOT/git.log" 2>&1 || return 1
+    fi
+    au_load_current || { au_log "[error] 当前版本记录不完整"; return 1; }
+    if [ -n "$AU_CURRENT" ]; then
+        au_log "先启动已验证缓存版本，再检查远程更新"
+        au_start "$AU_CURRENT" || return 1
+        next_check=$SECONDS
+    else
+        au_fetch || { au_log "[error] 首次拉取 Git 失败，无缓存版本可用"; return 1; }
+        au_deploy "$AU_FETCHED" || return 1
+        next_check=$((SECONDS + AU_INTERVAL))
+    fi
+    au_log "每 $AU_INTERVAL 秒检查分支 $BRANCH"
+    [ -n "$AU_HEALTH_URL" ] || au_log "[warn] 未设置 HEALTHCHECK_URL，仅检查进程存活"
+    while [ "$AU_STOPPING" = 0 ]; do
+        au_app_alive || { au_log "[error] 后端意外退出，交由 Docker 重启"; return 1; }
+        if (( SECONDS >= next_check )); then
+            au_check_update || return 1
+            next_check=$((SECONDS + AU_INTERVAL))
+        fi
+        au_run "$AU_ROOT" 2 sleep 1 || { [ "$AU_STOPPING" != 0 ] || return 1; }
+    done
+    au_log "更新管理器已停止"
+}
+
+# 允许测试只加载上面的函数，不执行容器启动逻辑。
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
 # 设置环境变量、工作目录等（如果需要）
 # 例如：
 # export PYTHONPATH=/app
@@ -16,11 +323,11 @@ set -euo pipefail
 if [ -n "${GITEE_TOKEN:-}" ]; then
     # 使用 Gitee 配置
     echo "检测到 Gitee 配置,使用 Gitee 仓库"
-    GIT_REPO="https://${GITEE_USERNAME}:${GITEE_TOKEN}@gitee.com/${GITEE_USERNAME}/${GITHUB_REPO}.git"
+    GIT_REPO="https://gitee.com/${GITEE_USERNAME}/${GITHUB_REPO}.git"
 else
     # 使用 GitHub 配置
     echo "使用 GitHub 仓库"
-    GIT_REPO="https://${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${GITHUB_REPO}.git"
+    GIT_REPO="https://github.com/${GITHUB_USERNAME}/${GITHUB_REPO}.git"
 fi
 
 TARGET_DIR="/app"
@@ -62,13 +369,36 @@ if [ -n "${GITEE_TOKEN:-}" ]; then
     echo "https://${GITEE_USERNAME}:${GITEE_TOKEN}@gitee.com" > ~/.git-credentials
     echo "使用 Gitee 认证"
 else
-    echo "https://${GITHUB_PAT}@github.com" > ~/.git-credentials
+    : > ~/.git-credentials
+    if [ -n "${GITHUB_PAT:-}" ]; then
+        echo "https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com" > ~/.git-credentials
+    fi
     echo "使用 GitHub 认证"
 fi
+chmod 600 ~/.git-credentials
 
 # 设置 Git 环境变量，避免密码提示
 export GIT_TERMINAL_PROMPT=0
-export GIT_ASKPASS=/bin/echo
+export GIT_ASKPASS=/bin/false
+
+# 自动更新由独立管理器负责，不覆盖 /app 或 /data 中的用户文件。
+# 在旧的同步、安装依赖逻辑之前分流，依赖安装在各版本的独立虚拟环境中。
+case "${AUTO_UPDATE:-false}" in
+    true)
+        if [ -d /data ] && ! is_empty_dir /data; then
+            echo "[error] AUTO_UPDATE=true 与非空 /data 文件同步模式不能同时使用。"
+            exit 1
+        fi
+        export GIT_REPO BRANCH
+        au_main
+        exit 0
+        ;;
+    false) ;;
+    *)
+        echo "[error] AUTO_UPDATE 必须为 true 或 false。"
+        exit 1
+        ;;
+esac
 
 
 # 如果是 Debian/Ubuntu 基础镜像
@@ -152,16 +482,11 @@ cd "$TARGET_DIR"
 # 更新依赖
 pip install --upgrade -i https://mirrors.aliyun.com/pypi/simple/ pip
 # 查找所有 requirements.txt 文件，并对每个文件执行 pip install
-find . -name "requirements.txt" | while read file; do
+if find . -name "requirements.txt" -print0 | while IFS= read -r -d '' file; do
     echo "找到 requirements.txt in: $(dirname "$file")"
     echo "安装依赖 $file..."
-    pip install -r "$file"
-done
-
-
-
-# 检查pip安装是否成功
-if [ $? -eq 0 ]; then
+    pip install -r "$file" || exit 1
+done; then
     echo "所有依赖已更新完毕."
 else
     echo "更新依赖失败,退出"

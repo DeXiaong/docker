@@ -5,3 +5,8 @@
 .history
 
 my_admin_server.tar
+
+!compose.auto-update.yml
+.env
+runtime/
+__pycache__/

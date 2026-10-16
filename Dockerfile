@@ -22,10 +22,14 @@ ENV LANG="C.UTF-8" \
 ENV GITHUB_PAT=
 ENV GITHUB_USERNAME=
 ENV GITHUB_REPO=
-ENV BRANCH=mian
+ENV BRANCH=main
 ENV PROXY_HOST=
 ENV RUN_COMMAND="python3 main.py"
-ENV ENTRYPOINT_URL="https://gitee.com/dxll/entrypoint/raw/main/entrypoint.sh"
+ENV ENTRYPOINT_URL=""
+ENV AUTO_UPDATE=false \
+    UPDATE_INTERVAL=60 \
+    UPDATE_STATE_DIR=/config/auto-update \
+    HEALTHCHECK_URL=""
 
 
 # 设置工作目录
@@ -44,6 +48,8 @@ RUN apt-get update -y \
     wget \
     busybox \
     git\
+    util-linux coreutils \
+    libpq-dev gcc python3-dev \
     && pip install --upgrade pip
 
 
@@ -60,7 +66,9 @@ RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
 # 检查是否设置了 ENTRYPOINT_URL\n\
-if [ -n "${ENTRYPOINT_URL:-}" ] && [ "${ENTRYPOINT_URL}" != "" ]; then\n\
+if [ "${AUTO_UPDATE:-false}" = "true" ]; then\n\
+    echo "自动更新模式使用镜像内置启动脚本，忽略 ENTRYPOINT_URL"\n\
+elif [ -n "${ENTRYPOINT_URL:-}" ] && [ "${ENTRYPOINT_URL}" != "" ]; then\n\
     echo "检查 entrypoint.sh 更新: ${ENTRYPOINT_URL}"\n\
     # 尝试下载新版本\n\
     if curl -fsSL "${ENTRYPOINT_URL}" -o /entrypoint.sh.new 2>/dev/null || wget -q -O /entrypoint.sh.new "${ENTRYPOINT_URL}" 2>/dev/null; then\n\

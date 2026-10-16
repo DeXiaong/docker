@@ -1,0 +1,6 @@
+.git
+.history
+.env
+runtime
+*.tar
+**/__pycache__

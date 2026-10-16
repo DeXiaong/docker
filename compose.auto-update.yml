@@ -1,0 +1,22 @@
+services:
+  my_admin_server:
+    build: .
+    image: my_admin_server:auto-update
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      LANG: C.UTF-8
+      AUTO_UPDATE: "true"
+      ENTRYPOINT_URL: ""
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-60}
+      BRANCH: ${BRANCH:-main}
+      RUN_COMMAND: ${RUN_COMMAND:-python3 main.py}
+      HEALTHCHECK_URL: ${HEALTHCHECK_URL:-}
+    volumes:
+      - ./runtime/config:/config
+    ports:
+      - "${APP_PORT:-4567}:4567"
