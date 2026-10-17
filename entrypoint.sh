@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-# 自动更新管理器：仅使用 Bash 和镜像内的常规 Linux 工具。
+# 自动更新管理器：Bash 调度，内嵌 Python 标准库同步代码，使用镜像内工具。
 au_log() { printf '[auto-update] %s\n' "$*"; }
 
 au_validate_number() {
@@ -113,12 +113,133 @@ au_app_alive() {
     [ -n "${AU_APP_PID:-}" ] && kill -0 "$AU_APP_PID" 2>/dev/null
 }
 
+# 运行目录固定为 /app；只替换 Git 管理的文件，保留本地配置和运行数据。
+au_sync_app() {
+    local release="$1" program
+    program=$(cat <<'PY'
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import subprocess
+import sys
+import tempfile
+
+source, target = map(Path, sys.argv[1:3])
+reserved = {".auto-update-files.json", ".auto-update.lock"}
+
+def protected(name):
+    return any(part == ".git" or part in reserved or part == ".env"
+               or part.startswith(".env.") for part in PurePosixPath(name).parts)
+
+def checked(names):
+    result = set()
+    for name in names:
+        if not isinstance(name, str) or not name or "\\" in name or "\0" in name:
+            raise ValueError("invalid managed file name")
+        path = PurePosixPath(name)
+        if path.is_absolute() or Path(name).drive or any(part in {".", ".."} for part in name.split("/")):
+            raise ValueError("managed path must stay inside /app")
+        if not protected(name):
+            result.add(name)
+    return result
+
+def git_files(directory):
+    data = subprocess.check_output(["git", "-C", str(directory), "ls-files", "-z"])
+    return checked(os.fsdecode(name) for name in data.split(b"\0") if name)
+
+def write_manifest(names):
+    fd, temporary = tempfile.mkstemp(prefix=".auto-update-manifest-", dir=target)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(sorted(names), stream)
+        os.replace(temporary, manifest)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+def validate_parents(name):
+    # 不跟随本地目录中的软链接，以免代码复制或清理写到 /app 外。
+    for parent in (target / name).parents:
+        if parent == target:
+            break
+        if parent.is_symlink():
+            raise ValueError("managed file parent is a symlink: " + name)
+        if parent.exists() and not parent.is_dir() and parent.relative_to(target).as_posix() not in obsolete:
+            raise ValueError("local file blocks code directory: " + name)
+
+try:
+    if not target.is_absolute() or target.is_symlink():
+        raise ValueError("application directory must be an absolute, real directory")
+    target.mkdir(parents=True, exist_ok=True)
+    target = target.resolve()
+    manifest = target / ".auto-update-files.json"
+    current = git_files(source)
+    if manifest.is_symlink():
+        raise ValueError("managed file manifest must not be a symlink")
+    if manifest.exists():
+        previous = checked(json.loads(manifest.read_text(encoding="utf-8")))
+    elif (target / ".git").exists():
+        previous = git_files(target)
+    else:
+        previous = set()
+    obsolete = previous - current
+    for name in current | previous:
+        validate_parents(name)
+    for name in current:
+        src = source / name
+        if not src.is_file() and not src.is_symlink():
+            raise ValueError("unsupported Git entry: " + name)
+
+    # 先登记所有可能改动的路径；中途失败后，回滚也能删除新版新增文件。
+    write_manifest(previous | current)
+    for name in sorted(obsolete, key=lambda value: value.count("/"), reverse=True):
+        destination = target / name
+        if destination.is_symlink() or destination.is_file():
+            destination.unlink()
+        parent = destination.parent
+        while parent != target:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    for name in sorted(current):
+        src, destination = source / name, target / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_dir() and not destination.is_symlink():
+            # 非空目录可能包含用户数据，不能为了替换代码而递归删除。
+            destination.rmdir()
+        fd, temporary = tempfile.mkstemp(prefix=".auto-update-copy-", dir=destination.parent)
+        os.close(fd)
+        try:
+            if src.is_symlink():
+                os.unlink(temporary)
+                os.symlink(os.readlink(src), temporary)
+            else:
+                shutil.copy2(src, temporary)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.lexists(temporary):
+                os.unlink(temporary)
+    write_manifest(current)
+except Exception as error:
+    print("[auto-update] /app code sync failed: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+    ) || return 1
+    au_run "$AU_ROOT" "$AU_BUILD_TIMEOUT" python3 -c "$program" "$release/code" "$AU_APP_DIR"
+}
+
 au_start() {
-    local release="$1" started=$SECONDS commit remaining
+    local release="$1" started commit remaining
     commit=$(cat "$release/commit") || return 1
-    au_log "启动版本 ${commit:0:12}"
+    au_sync_app "$release" || return 1
+    started=$SECONDS
+    au_log "启动版本 ${commit:0:12}，运行目录 $AU_APP_DIR"
     (
-        cd -- "$release/code" || exit 1
+        cd -- "$AU_APP_DIR" || exit 1
         export VIRTUAL_ENV="$release/venv" PATH="$release/venv/bin:$PATH"
         export PYTHONUNBUFFERED=1 APP_COMMIT="$commit"
         unset PYTHONHOME
@@ -269,6 +390,13 @@ au_main() {
     key=$(printf '%s' "${GIT_REPO##*@}#$BRANCH" | sha256sum) || return 1
     mkdir -p -- "${UPDATE_STATE_DIR:-/config/auto-update}" || return 1
     AU_ROOT=$(cd -- "${UPDATE_STATE_DIR:-/config/auto-update}" && pwd) || return 1
+    AU_APP_DIR="${TARGET_DIR:-/app}"
+    mkdir -p -- "$AU_APP_DIR" || return 1
+    [ ! -L "$AU_APP_DIR" ] && [ ! -L "$AU_APP_DIR/.auto-update.lock" ] || {
+        au_log "[error] 应用目录和运行锁不能是软链接"; return 1;
+    }
+    exec {AU_APP_LOCK_FD}>"$AU_APP_DIR/.auto-update.lock"
+    flock -n "$AU_APP_LOCK_FD" || { au_log "[error] /app 已有更新管理器运行"; return 1; }
     AU_ROOT="$AU_ROOT/${key:0:16}"
     AU_REPO="$AU_ROOT/repository.git"
     AU_RELEASES="$AU_ROOT/releases"
@@ -381,7 +509,7 @@ chmod 600 ~/.git-credentials
 export GIT_TERMINAL_PROMPT=0
 export GIT_ASKPASS=/bin/false
 
-# 自动更新由独立管理器负责，不覆盖 /app 或 /data 中的用户文件。
+# 自动更新在缓存目录准备版本，再将受管代码同步到 /app；保留本地 .env 和运行文件。
 # 在旧的同步、安装依赖逻辑之前分流，依赖安装在各版本的独立虚拟环境中。
 case "${AUTO_UPDATE:-false}" in
     true)

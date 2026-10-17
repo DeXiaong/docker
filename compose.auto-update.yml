@@ -18,5 +18,6 @@ services:
       HEALTHCHECK_URL: ${HEALTHCHECK_URL:-}
     volumes:
       - ./runtime/config:/config
+      - ./runtime/app:/app
     ports:
       - "${APP_PORT:-4567}:4567"
