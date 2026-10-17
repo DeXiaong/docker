@@ -88,25 +88,123 @@ au_fetch() {
 }
 
 au_prepare() {
-    local commit="$1" requirement
+    local commit="$1"
     AU_CANDIDATE=$(mktemp -d "$AU_RELEASES/$commit.XXXXXX") || return 1
     au_log "准备版本 ${commit:0:12}，旧服务继续运行"
     au_run "$AU_ROOT" "$AU_BUILD_TIMEOUT" git clone --quiet --no-hardlinks --no-checkout \
         "$AU_REPO" "$AU_CANDIDATE/code" >"$AU_ROOT/build-git.log" 2>&1 || return 1
     au_run "$AU_ROOT" "$AU_BUILD_TIMEOUT" git -C "$AU_CANDIDATE/code" \
         checkout --quiet --detach "$commit" >>"$AU_ROOT/build-git.log" 2>&1 || return 1
-    au_run "$AU_ROOT" "$AU_BUILD_TIMEOUT" python3 -m venv "$AU_CANDIDATE/venv" || return 1
-    find "$AU_CANDIDATE/code" -name .git -prune -o -type f -name requirements.txt -print0 \
-        >"$AU_CANDIDATE/requirements.list" || return 1
-    while IFS= read -r -d '' requirement; do
-        au_log "安装依赖：${requirement#"$AU_CANDIDATE/code/"}"
-        VIRTUAL_ENV="$AU_CANDIDATE/venv" PATH="$AU_CANDIDATE/venv/bin:$PATH" \
-            au_run "$(dirname "$requirement")" "$AU_BUILD_TIMEOUT" \
-            "$AU_CANDIDATE/venv/bin/python" -m pip install --disable-pip-version-check \
-            -r "$requirement" || return 1
-    done <"$AU_CANDIDATE/requirements.list"
     printf '%s\n' "$commit" >"$AU_CANDIDATE/commit" || return 1
+    au_dependency_manifest "$AU_CANDIDATE" || return 1
     touch "$AU_CANDIDATE/.ready" || return 1
+}
+
+# 指纹只覆盖依赖输入；普通业务代码变化不会触发 pip。
+au_dependency_manifest() {
+    local release="$1" program
+    program=$(cat <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import platform
+import re
+import subprocess
+import sys
+
+release = Path(sys.argv[1])
+source = (release / "code").resolve()
+tracked = subprocess.check_output(["git", "-C", str(source), "ls-files", "-z"])
+names = sorted(os.fsdecode(name) for name in tracked.split(b"\0") if name)
+names = [name for name in names if not {".git", ".venv", "venv"} & set(Path(name).parts)]
+requirements = [name for name in names if Path(name).name == "requirements.txt"]
+digest = hashlib.sha256()
+digest.update(("dependencies-v1\n" + sys.version + "\n" + platform.machine()).encode())
+seen = set()
+local_dependency = False
+
+def include(path):
+    global local_dependency
+    path = path.resolve()
+    name = path.relative_to(source).as_posix()
+    if name in seen:
+        return
+    seen.add(name)
+    content = path.read_bytes()
+    digest.update(name.encode() + b"\0" + content + b"\0")
+    if path.suffix != ".txt":
+        return
+    for line in content.decode("utf-8-sig").replace("\\\n", "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"^(?:-r\s*|-c\s*|--requirement(?:=|\s+)|--constraint(?:=|\s+))(.+)", line)
+        if match:
+            value = re.split(r"\s+#", match.group(1), maxsplit=1)[0].strip().strip("'\"")
+            if "://" in value or chr(36) + "{" in value:
+                local_dependency = True
+            else:
+                include(path.parent / value)
+        elif (line.startswith((".", "/", "-e ", "--editable", "file:"))
+              or " @ file:" in line or chr(36) + "{" in line
+              or (source / line).exists() or (path.parent / line).exists()):
+            local_dependency = True
+
+for name in requirements:
+    include(source / name)
+for name in names:
+    if Path(name).name in {"pyproject.toml", "setup.py", "setup.cfg"}:
+        include(source / name)
+# 本地包/动态依赖不能只看 requirements；它们随代码提交重新安装。
+if local_dependency:
+    digest.update((release / "commit").read_bytes())
+(release / "requirements.list").write_bytes(b"".join(os.fsencode(name) + b"\0" for name in requirements))
+(release / "requirements.sha256").write_text(digest.hexdigest() + "\n", encoding="ascii")
+PY
+    ) || return 1
+    au_run "$AU_ROOT" "$AU_BUILD_TIMEOUT" python3 -c "$program" "$release"
+}
+
+au_install_dependencies() {
+    local release="$1" fingerprint requirement installed="" status
+    local stamp="$AU_VENV/.requirements.sha256"
+    [ ! -L "$AU_VENV" ] && [ ! -L "$stamp" ] || {
+        au_log "[error] 共享虚拟环境及依赖标记不能是软链接"; return 1;
+    }
+    fingerprint=$(cat "$release/requirements.sha256") || return 1
+    if [ ! -x "$AU_VENV/bin/python" ]; then
+        au_log "创建共享依赖环境 $AU_VENV"
+        au_run "$AU_ROOT" "$AU_BUILD_TIMEOUT" python3 -m venv "$AU_VENV" || return 1
+        rm -f -- "$stamp"
+    fi
+    if [ -f "$stamp" ]; then installed=$(cat "$stamp") || return 1; fi
+    if [ "$installed" = "$fingerprint" ]; then
+        au_log "依赖未变化，复用 $AU_VENV，跳过安装"
+        return 0
+    fi
+    # pip 可能安装了一部分包才失败；不得留下表示环境完整的旧标记。
+    rm -f -- "$stamp" || return 1
+    while IFS= read -r -d '' requirement; do
+        au_log "同步依赖：$requirement → $AU_VENV"
+        if VIRTUAL_ENV="$AU_VENV" PATH="$AU_VENV/bin:$PATH" \
+            au_run "$(dirname "$AU_APP_DIR/$requirement")" "$AU_BUILD_TIMEOUT" \
+            "$AU_VENV/bin/python" -m pip install --disable-pip-version-check \
+            -r "$AU_APP_DIR/$requirement"; then
+            :
+        else
+            status=$?
+            if [ "$status" = 124 ]; then
+                au_log "[error] 依赖安装超过 $AU_BUILD_TIMEOUT 秒"
+            elif [ "$status" = 137 ]; then
+                au_log "[error] 依赖安装被 SIGKILL 强制终止，请检查内存限制及超时"
+            else
+                au_log "[error] 依赖安装失败，退出码 $status"
+            fi
+            return 1
+        fi
+    done <"$release/requirements.list"
+    au_run "$AU_APP_DIR" "$AU_BUILD_TIMEOUT" "$AU_VENV/bin/python" -m pip check || return 1
+    printf '%s\n' "$fingerprint" >"$stamp.tmp" && mv -f -- "$stamp.tmp" "$stamp"
 }
 
 au_app_alive() {
@@ -126,7 +224,7 @@ import sys
 import tempfile
 
 source, target = map(Path, sys.argv[1:3])
-reserved = {".auto-update-files.json", ".auto-update.lock"}
+reserved = {".auto-update-files.json", ".auto-update.lock", ".venv"}
 
 def protected(name):
     return any(part == ".git" or part in reserved or part == ".env"
@@ -235,12 +333,14 @@ PY
 au_start() {
     local release="$1" started commit remaining
     commit=$(cat "$release/commit") || return 1
+    au_dependency_manifest "$release" || return 1
     au_sync_app "$release" || return 1
+    au_install_dependencies "$release" || return 1
     started=$SECONDS
     au_log "启动版本 ${commit:0:12}，运行目录 $AU_APP_DIR"
     (
         cd -- "$AU_APP_DIR" || exit 1
-        export VIRTUAL_ENV="$release/venv" PATH="$release/venv/bin:$PATH"
+        export VIRTUAL_ENV="$AU_VENV" PATH="$AU_VENV/bin:$PATH"
         export PYTHONUNBUFFERED=1 APP_COMMIT="$commit"
         unset PYTHONHOME
         exec setsid bash -c "${RUN_COMMAND:-python3 main.py}"
@@ -282,8 +382,7 @@ au_load_current() {
     IFS= read -r name <"$AU_ROOT/current" || return 1
     [[ "$name" =~ ^[0-9a-f]{40}([0-9a-f]{24})?\.[a-zA-Z0-9]+$ ]] || return 1
     AU_CURRENT="$AU_RELEASES/$name"
-    [ -f "$AU_CURRENT/.ready" ] && [ -d "$AU_CURRENT/code" ] && \
-        [ -x "$AU_CURRENT/venv/bin/python" ] || return 1
+    [ -f "$AU_CURRENT/.ready" ] && [ -d "$AU_CURRENT/code" ] || return 1
     AU_CURRENT_COMMIT=$(cat "$AU_CURRENT/commit") || return 1
     [ "${name%%.*}" = "$AU_CURRENT_COMMIT" ]
 }
@@ -391,6 +490,7 @@ au_main() {
     mkdir -p -- "${UPDATE_STATE_DIR:-/config/auto-update}" || return 1
     AU_ROOT=$(cd -- "${UPDATE_STATE_DIR:-/config/auto-update}" && pwd) || return 1
     AU_APP_DIR="${TARGET_DIR:-/app}"
+    AU_VENV="$AU_APP_DIR/.venv"
     mkdir -p -- "$AU_APP_DIR" || return 1
     [ ! -L "$AU_APP_DIR" ] && [ ! -L "$AU_APP_DIR/.auto-update.lock" ] || {
         au_log "[error] 应用目录和运行锁不能是软链接"; return 1;
@@ -510,7 +610,7 @@ export GIT_TERMINAL_PROMPT=0
 export GIT_ASKPASS=/bin/false
 
 # 自动更新在缓存目录准备版本，再将受管代码同步到 /app；保留本地 .env 和运行文件。
-# 在旧的同步、安装依赖逻辑之前分流，依赖安装在各版本的独立虚拟环境中。
+# 在旧的同步、安装依赖逻辑之前分流，依赖统一安装在 /app/.venv，未变化时跳过安装。
 case "${AUTO_UPDATE:-false}" in
     true)
         if [ -d /data ] && ! is_empty_dir /data; then
